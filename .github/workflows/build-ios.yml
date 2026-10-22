@@ -1,16 +1,18 @@
-name: Build KRYONIX IPA
+name: Build KRYONIX Unsigned IPA
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -21,93 +23,51 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Install signing certificate and profile
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
-          PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
-          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-
-          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
-          echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          PROFILE_UUID=$(/usr/bin/security cms -D -i "$PP_PATH" | /usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin)
-          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-
-          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
-
-      - name: Archive
-        env:
-          DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
-          CODE_SIGN_IDENTITY: ${{ secrets.CODE_SIGN_IDENTITY }}
+      - name: Build KRYONIX unsigned
         run: |
           xcodebuild \
             -project KRYONIX.xcodeproj \
             -scheme KRYONIX \
             -configuration Release \
+            -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            -archivePath "$RUNNER_TEMP/KRYONIX.xcarchive" \
-            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
-            archive
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
-      - name: Read profile and create ExportOptions
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          EXPORT_METHOD: ${{ secrets.EXPORT_METHOD }}
+      - name: Find KRYONIX.app
         run: |
-          METHOD="${EXPORT_METHOD:-development}"
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>$METHOD</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>teamID</key>
-            <string>$APPLE_TEAM_ID</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>com.kryonix.app</key>
-              <string>$PROFILE_UUID</string>
-            </dict>
-          </dict>
-          </plist>
-          EOF
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products" \
+            -type d -name "KRYONIX.app" | head -1)
 
-      - name: Export IPA
+          if [ -z "$APP_PATH" ]; then
+            echo "KRYONIX.app not found"
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "Found: $APP_PATH"
+
+      - name: Create unsigned IPA
         run: |
-          mkdir -p "$RUNNER_TEMP/export"
-          xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/KRYONIX.xcarchive" \
-            -exportPath "$RUNNER_TEMP/export" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
 
-      - name: Upload IPA
+          cp -R "$APP_PATH" \
+            "$RUNNER_TEMP/ipa/Payload/KRYONIX.app"
+
+          cd "$RUNNER_TEMP/ipa"
+
+          zip -qry \
+            "$RUNNER_TEMP/KRYONIX-unsigned.ipa" \
+            Payload
+
+          ls -lh "$RUNNER_TEMP/KRYONIX-unsigned.ipa"
+
+      - name: Upload KRYONIX IPA
         uses: actions/upload-artifact@v4
         with:
-          name: KRYONIX-IPA
-          path: ${{ runner.temp }}/export/*.ipa
+          name: KRYONIX-Unsigned-IPA
+          path: ${{ runner.temp }}/KRYONIX-unsigned.ipa
           if-no-files-found: error
-
-      - name: Cleanup signing files
-        if: ${{ always() }}
-        run: |
-          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/build_certificate.p12" "$RUNNER_TEMP/build_pp.mobileprovision"
